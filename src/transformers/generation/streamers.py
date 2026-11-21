@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import asyncio
-import sys
 import time
 import unicodedata
 from queue import Queue
@@ -95,11 +94,12 @@ class TextStreamer(BaseStreamer):
         self.token_cache.extend(value.tolist())
         text = cast(str, self.tokenizer.decode(self.token_cache, **self.decode_kwargs))
 
-        # After the symbol for a new line, we flush the cache.
+        # After the symbol for a new line, we flush the cache but keep the last token as decoding context to preserve leading spaces
+        # on the next line
         if text.endswith("\n"):
             printable_text = text[self.print_len :]
-            self.token_cache = []
-            self.print_len = 0
+            self.token_cache = self.token_cache[-1:]
+            self.print_len = len(self.tokenizer.decode(self.token_cache[-1], **self.decode_kwargs))
         # If the last token is a CJK character, we print the characters.
         elif len(text) > 0 and self._is_chinese_char(ord(text[-1])):
             printable_text = text[self.print_len :]
@@ -289,9 +289,6 @@ class AsyncTextIteratorStreamer(TextStreamer):
         self.stop_signal = None
         self.timeout = timeout
         self.loop = asyncio.get_running_loop()
-        timeout_context = getattr(asyncio, "timeout", None)
-        self.has_asyncio_timeout = sys.version_info >= (3, 11) and callable(timeout_context)
-        self.asyncio_timeout = timeout_context if self.has_asyncio_timeout else None
 
     def on_finalized_text(self, text: str, stream_end: bool = False):
         """Put the new text in the queue. If the stream is ending, also put a stop signal in the queue."""
@@ -303,19 +300,12 @@ class AsyncTextIteratorStreamer(TextStreamer):
         return self
 
     async def __anext__(self):
-        try:
-            if self.has_asyncio_timeout and self.asyncio_timeout is not None:
-                async with self.asyncio_timeout(self.timeout):
-                    value = await self.text_queue.get()
-            else:
-                value = await asyncio.wait_for(self.text_queue.get(), timeout=self.timeout)
-        except asyncio.TimeoutError:
-            raise TimeoutError()
+        async with asyncio.timeout(self.timeout):
+            value = await self.text_queue.get()
+        if value == self.stop_signal:
+            raise StopAsyncIteration()
         else:
-            if value == self.stop_signal:
-                raise StopAsyncIteration()
-            else:
-                return value
+            return value
 
 
 class TextDiffusionStreamer(TextStreamer):
