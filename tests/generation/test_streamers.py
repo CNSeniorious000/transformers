@@ -176,6 +176,27 @@ class StreamerTester(unittest.TestCase):
             release.set()
             thread.join()
 
+    def test_iterator_streamer_waits_for_complete_combining_mark(self):
+        # ByteLevel represents the two UTF-8 bytes of U+0301 as separate tokens.
+        backend = Tokenizer(models.BPE(vocab={"e": 0, "Ì": 1, "ģ": 2}, merges=[]))
+        backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+        backend.decoder = decoders.ByteLevel()
+        tokenizer = TokenizersBackend(tokenizer_object=backend)
+        text = "e\u0301"
+        input_ids = tokenizer.encode(text, add_special_tokens=False)
+        self.assertEqual(input_ids, [0, 1, 2])
+
+        streamer = TextIteratorStreamer(tokenizer)
+        chunks = []
+        for token_id, expected in zip(input_ids, ("e", "", "\u0301")):
+            streamer.put(torch.tensor([token_id]))
+            chunk = streamer.text_queue.get_nowait()
+            self.assertEqual(chunk, expected)
+            chunks.append(chunk)
+        streamer.end()
+
+        self.assertEqual("".join(chunks) + "".join(streamer), text)
+
     def test_iterator_streamer_preserves_spaces_after_newline(self):
         backend = Tokenizer(models.BPE(vocab={"[UNK]": 0, "▁": 1, "\n": 2, "a": 3, "b": 4}, merges=[]))
         backend.pre_tokenizer = pre_tokenizers.Metaspace(prepend_scheme="always", split=False)
