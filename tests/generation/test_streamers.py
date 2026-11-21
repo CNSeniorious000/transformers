@@ -28,6 +28,7 @@ from transformers import (
     TokenizersBackend,
     is_torch_available,
 )
+from transformers.convert_slow_tokenizer import bytes_to_unicode
 from transformers.testing_utils import CaptureStdout, require_torch, torch_device
 from transformers.utils.logging import _get_library_root_logger
 
@@ -175,6 +176,86 @@ class StreamerTester(unittest.TestCase):
         finally:
             release.set()
             thread.join()
+
+    def test_iterator_streamer_distinguishes_partial_utf8_from_replacement_character(self):
+        alphabet = bytes_to_unicode()
+        pieces = [
+            b"ab\xe0\xb8",
+            b"\xa0",
+            b"\xef\xbf\xbd",
+            b"\xef\xbf",
+            b"\xbd",
+            b"\n\xe0",
+            b"\xb8",
+            b"e\xcc",
+            b"\x81",
+            b"\xed\xa0",
+            b"a\xf0\xa0\x80",
+            b"\x80",
+        ]
+        vocab = {"".join(alphabet[byte] for byte in piece): index for index, piece in enumerate(pieces)}
+        backend = Tokenizer(models.BPE(vocab=vocab, merges=[]))
+        backend.decoder = decoders.ByteLevel()
+        tokenizer = TokenizersBackend(tokenizer_object=backend)
+        streamer = TextIteratorStreamer(tokenizer)
+
+        # Include the incomplete suffix and printable prefix in a single token, a newline
+        # before a partial code point, a combining mark, and malformed (not partial) UTF-8.
+        ids = [0, 1, 2, 3, 4, 5, 6, 1, 7, 8, 9, 10, 11, 3]
+        chunks = ["ab", "ภ", "\ufffd", "", "\ufffd", "\n", "", "ภ", "e", "\u0301", "\ufffd\ufffd", "a", "𠀀", ""]
+        printed = ""
+        for token_id, expected in zip(ids, chunks):
+            streamer.put(torch.tensor([token_id]))
+            chunk = streamer.text_queue.get_nowait()
+            self.assertEqual(chunk, expected)
+            printed += chunk
+        streamer.end()
+        self.assertEqual(list(streamer), ["\ufffd"])
+        self.assertEqual(printed + "\ufffd", tokenizer.decode(ids))
+
+        streamer.end()
+        self.assertEqual(list(streamer), [""])
+        streamer.put(torch.tensor([[2]]))
+        streamer.end()
+        self.assertEqual(list(streamer), ["\ufffd", ""])
+
+    def test_iterator_streamer_keeps_byte_level_special_tokens_and_formatting_separate(self):
+        backend = Tokenizer(models.BPE(vocab={"aà¸": 0, "ł": 1, "<": 2, "br": 3, ">": 4, "b": 5, "Ġ": 6}, merges=[]))
+        backend.decoder = decoders.ByteLevel()
+        backend.add_special_tokens(["<s>"])
+        backend.add_tokens(["literal\ufffd"])
+        tokenizer = TokenizersBackend(tokenizer_object=backend)
+        # Re-adding a special token can clear its AddedToken.special property without
+        # changing the backend's skip_special_tokens behavior.
+        tokenizer.backend_tokenizer.add_tokens(["<s>"])
+
+        prompt = backend.token_to_id("<s>")
+        added = backend.token_to_id("literal\ufffd")
+        for skip_special_tokens, expected in [
+            (True, ["a", "", "ภ", "", "", "", "", "<br>b ", "literal\ufffd", ""]),
+            (False, ["a", "", "", "", "", "", "", "\ufffd<s>\ufffd<br>b ", "literal\ufffd", ""]),
+        ]:
+            with self.subTest(skip_special_tokens=skip_special_tokens):
+                ids = [0, prompt, 1, 2, 3, 4, 5, 6, added]
+                streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=skip_special_tokens)
+                streamer.put(torch.tensor([[2, 3]]))
+                for token_id in ids:
+                    streamer.put(torch.tensor([token_id]))
+                streamer.end()
+                chunks = list(streamer)
+                self.assertEqual(chunks, expected)
+                self.assertEqual("".join(chunks), tokenizer.decode(ids, skip_special_tokens=skip_special_tokens))
+
+    def test_iterator_streamer_does_not_assume_raw_bytes_for_decoder_sequences(self):
+        backend = Tokenizer(models.BPE(vocab={"abà¸": 0, "ł": 1, "ï¿½": 2}, merges=[]))
+        backend.decoder = decoders.Sequence([decoders.ByteLevel(), decoders.Fuse()])
+        tokenizer = TokenizersBackend(tokenizer_object=backend)
+        streamer = TextIteratorStreamer(tokenizer)
+
+        for token_id in [0, 1, 2]:
+            streamer.put(torch.tensor([token_id]))
+        streamer.end()
+        self.assertEqual(list(streamer), ["", "abภ", "", "\ufffd"])
 
     def test_iterator_streamer_preserves_spaces_after_newline(self):
         backend = Tokenizer(models.BPE(vocab={"[UNK]": 0, "▁": 1, "\n": 2, "a": 3, "b": 4}, merges=[]))

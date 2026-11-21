@@ -15,14 +15,87 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import time
 import unicodedata
+from functools import cache
 from queue import Queue
 from typing import TYPE_CHECKING, Any, cast
 
 
 if TYPE_CHECKING:
+    from tokenizers import Tokenizer
+
     from ..tokenization_utils_base import PreTrainedTokenizerBase
+
+
+@cache
+def _byte_level_alphabet() -> dict[str, int]:
+    from ..convert_slow_tokenizer import bytes_to_unicode
+
+    return {char: byte for byte, char in bytes_to_unicode().items()}
+
+
+def _get_raw_byte_level_backend(tokenizer: PreTrainedTokenizerBase, decode_kwargs: dict[str, Any]) -> Tokenizer | None:
+    from ..utils import is_tokenizers_available
+
+    if not is_tokenizers_available():
+        return None
+
+    from tokenizers.decoders import ByteLevel
+
+    from ..tokenization_utils_base import PreTrainedTokenizerBase
+    from ..tokenization_utils_tokenizers import TokenizersBackend
+
+    # Other decoder stages, custom decode methods and text cleanup can change the decoded suffix.
+    if not isinstance(tokenizer, TokenizersBackend):
+        return None
+    if (
+        getattr(tokenizer.decode, "__func__", None) is not PreTrainedTokenizerBase.decode
+        or getattr(tokenizer._decode, "__func__", None) is not TokenizersBackend._decode
+        or decode_kwargs.keys() - {"clean_up_tokenization_spaces", "skip_special_tokens"}
+    ):
+        return None
+    backend = tokenizer.backend_tokenizer
+    if type(backend.decoder) is not ByteLevel:
+        return None
+    cleanup = decode_kwargs.get("clean_up_tokenization_spaces")
+    if cleanup is None:
+        cleanup = tokenizer.clean_up_tokenization_spaces
+    if cleanup and (
+        type(backend.model).__name__ != "BPE"
+        or tokenizer.clean_up_tokenization_spaces_for_bpe_even_though_it_will_corrupt_output
+    ):
+        return None
+    return backend
+
+
+def _byte_level_has_partial_utf8(backend: Tokenizer, token_ids: list[int], skip_special_tokens: bool) -> bool:
+    # A UTF-8 code point has at most three trailing bytes waiting for completion.
+    # Starting in the middle of an earlier code point does not affect this suffix:
+    # continuation bytes cannot start a new code point.
+    alphabet = _byte_level_alphabet()
+    tail = b""
+    for token_id in reversed(token_ids):
+        token = backend.id_to_token(token_id)
+        # Use the backend's own special-token filter, not the wrapper's list of special IDs.
+        if not token or (skip_special_tokens and not backend.decode([token_id], skip_special_tokens=True)):
+            continue
+        try:
+            token_bytes = bytes(alphabet[char] for char in token)
+        except KeyError:
+            # ByteLevel leaves the entire token untouched if any character is outside its alphabet.
+            token_bytes = token.encode("utf-8")
+        tail = (token_bytes + tail)[-3:]
+        if len(tail) == 3:
+            break
+
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    decoder.decode(tail, final=False)
+    pending = decoder.getstate()[0]
+    # Some Python implementations can also buffer an invalid surrogate prefix, which is
+    # already irrecoverable. Only an unfinished code point produces one replacement at EOF.
+    return pending.decode("utf-8", errors="replace") == "\ufffd"
 
 
 class BaseStreamer:
@@ -94,20 +167,37 @@ class TextStreamer(BaseStreamer):
         self.token_cache.extend(value.tolist())
         text = cast(str, self.tokenizer.decode(self.token_cache, **self.decode_kwargs))
 
-        # After the symbol for a new line, we flush the cache but keep the last token as decoding context to preserve leading spaces
-        # on the next line
-        if text.endswith("\n"):
+        # Only raw ByteLevel decoding lets us distinguish an unfinished UTF-8 suffix from a
+        # real replacement character. Keep using the tokenizer's decode for the text itself.
+        partial_utf8 = False
+        known_utf8_boundaries = False
+        if "\ufffd" in text[self.print_len :]:
+            backend = _get_raw_byte_level_backend(self.tokenizer, self.decode_kwargs)
+            if backend is not None:
+                known_utf8_boundaries = True
+                if text.endswith("\ufffd") and _byte_level_has_partial_utf8(
+                    backend, self.token_cache, self.decode_kwargs.get("skip_special_tokens", False)
+                ):
+                    partial_utf8 = True
+                    text = text[:-1]
+
+        # After the symbol for a new line, we flush the cache but keep the last token as decoding context to preserve
+        # leading spaces on the next line. A newline in the stable prefix must not discard pending UTF-8 bytes.
+        if text.endswith("\n") and not partial_utf8:
             printable_text = text[self.print_len :]
             self.token_cache = self.token_cache[-1:]
             self.print_len = len(self.tokenizer.decode(self.token_cache[-1], **self.decode_kwargs))
-        # If the last token is a CJK character, we print the characters.
-        elif len(text) > 0 and self._is_chinese_char(ord(text[-1])):
+        # If the stable prefix ends with a newline or CJK character, print it in full.
+        elif text.endswith("\n") or (len(text) > 0 and self._is_chinese_char(ord(text[-1]))):
             printable_text = text[self.print_len :]
             self.print_len += len(printable_text)
         # Letters (with their combining marks), digits and spaces are printed right away, so text without spaces (long
-        # words, Thai) streams too. Symbols wait for the next space: they may start some formatting (`\n`, `<br>`) or
-        # be an incomplete character (`\ufffd`).
-        elif all(char.isspace() or unicodedata.category(char)[0] in "LMN" for char in text[self.print_len :]):
+        # words, Thai) streams too. Symbols wait for the next space: they may start some formatting (`\n`, `<br>`).
+        # A replacement character is only safe to print here after checking the UTF-8 boundary.
+        elif all(
+            char.isspace() or unicodedata.category(char)[0] in "LMN" or (known_utf8_boundaries and char == "\ufffd")
+            for char in text[self.print_len :]
+        ):
             printable_text = text[self.print_len :]
             self.print_len += len(printable_text)
         # Otherwise, prints until the last space char (simple heuristic to avoid printing incomplete words,
